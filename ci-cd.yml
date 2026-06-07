@@ -1,0 +1,230 @@
+name: CI/CD — Churn Prediction Platform
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: eu-west-2
+  ECR_REPOSITORY: churn-prediction-production-api
+  ECS_CLUSTER: churn-prediction-production-cluster
+  ECS_SERVICE: churn-prediction-production-api-service
+  CONTAINER_NAME: churn-api
+
+jobs:
+  # ─── Job 1: Tests & Linting ─────────────────────────────────────────────────
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: churn_test_db
+          POSTGRES_USER: churn_user
+          POSTGRES_PASSWORD: churn_pass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff mypy
+
+      - name: Lint with Ruff
+        run: ruff check src/ tests/
+
+      - name: Type check with mypy
+        run: mypy src/api/main.py --ignore-missing-imports
+
+      - name: Run unit tests
+        env:
+          DATABASE_URL: postgresql://churn_user:churn_pass@localhost:5432/churn_test_db
+          MLFLOW_TRACKING_URI: http://localhost:5000
+        run: |
+          pytest tests/unit/ -v --cov=src --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  # ─── Job 2: Security Scan ───────────────────────────────────────────────────
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # ─── Job 3: Build & Push Docker Image ──────────────────────────────────────
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main'
+
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push Docker image
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build with build args for metadata
+          docker build \
+            --file infrastructure/docker/Dockerfile.api \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            --label "git.commit=${{ github.sha }}" \
+            --label "git.branch=${{ github.ref_name }}" \
+            --cache-from $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan pushed image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build-image.outputs.image }}
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+  # ─── Job 4: Deploy to ECS ───────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition churn-prediction-production-api \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Update ECS task definition with new image
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image }}
+
+      - name: Deploy to Amazon ECS (rolling update)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 10
+
+      - name: Smoke test deployed API
+        run: |
+          # Get ALB DNS from Terraform output (or hardcode your ALB URL)
+          API_URL=${{ secrets.PRODUCTION_API_URL }}
+
+          # Health check
+          curl -f "$API_URL/health" || exit 1
+
+          # Prediction smoke test
+          curl -f -X POST "$API_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "customer_id": "smoke_test_001",
+              "tenure_months": 12,
+              "monthly_charges": 75.5,
+              "total_charges": 906.0,
+              "plan_encoded": 1,
+              "contract_encoded": 0,
+              "payment_encoded": 0,
+              "num_support_calls_3m": 2,
+              "nps_score": 6
+            }' | python3 -c "
+          import json, sys
+          r = json.load(sys.stdin)
+          assert 'churn_probability' in r, 'Missing churn_probability'
+          assert 0 <= r['churn_probability'] <= 1, 'Invalid probability'
+          print(f'Smoke test passed: P(churn)={r[\"churn_probability\"]:.3f}')
+          "
+
+      - name: Notify Slack on success
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \":rocket: Churn API deployed successfully! Commit: ${{ github.sha }}\"}"
+
+      - name: Notify Slack on failure
+        if: failure()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": \":red_circle: Churn API deployment FAILED! Commit: ${{ github.sha }}\"}"
